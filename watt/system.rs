@@ -882,16 +882,19 @@ pub fn run_daemon(config: config::DaemonConfig) -> anyhow::Result<()> {
       }
     }
 
+    let mut cpu_deltas = cpu_deltas.into_iter().collect::<Vec<_>>();
+    cpu_deltas.sort_by_key(|(cpu, _)| cpu.number);
+
+    log::info!("applying CPU deltas to {len} CPUs", len = cpu_deltas.len());
+
     for (cpu, delta) in &cpu_deltas {
       delta
         .apply(&mut (**cpu).clone())
         .with_context(|| format!("failed to apply delta to {cpu}"))?;
     }
 
-    log::info!("applying CPU deltas to {len} CPUs", len = cpu_deltas.len());
-
     if let Some(turbo) = cpu_turbo {
-      cpu::Cpu::set_turbo(turbo, cpu_deltas.keys().map(|arc| &**arc))
+      cpu::Cpu::set_turbo(turbo, cpu_deltas.iter().map(|(arc, _)| &**arc))
         .context("failed to set CPU turbo")?;
     }
 
