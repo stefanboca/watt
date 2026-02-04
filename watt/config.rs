@@ -1026,7 +1026,6 @@ mod tests {
         epp: None,
         available_epbs: vec![],
         epb: None,
-        info: None,
       });
 
       let mut cpus = HashSet::new();
@@ -1110,7 +1109,6 @@ mod tests {
       epp:                   None,
       available_epbs:        vec![],
       epb:                   None,
-      info:                  None,
     });
 
     let mut cpus = HashSet::new();
