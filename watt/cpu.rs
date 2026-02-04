@@ -1,58 +1,73 @@
 use std::{
-  cell::OnceCell,
-  collections::HashMap,
   fmt,
   hash,
-  mem,
   string::ToString,
-  sync::Arc,
 };
 
 use anyhow::{
   Context,
-  anyhow,
   bail,
 };
 use yansi::Paint as _;
 
 use crate::fs;
 
-#[derive(Default, Debug, Clone, PartialEq)]
-struct CpuScanCache {
-  stat: OnceCell<HashMap<u32, CpuStat>>,
-  info: OnceCell<HashMap<u32, Arc<HashMap<String, String>>>>,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct CpuStat {
-  pub user:    u64,
-  pub nice:    u64,
-  pub system:  u64,
-  pub idle:    u64,
-  pub iowait:  u64,
-  pub irq:     u64,
-  pub softirq: u64,
-  pub steal:   u64,
+  user:    u64,
+  nice:    u64,
+  system:  u64,
+  idle:    u64,
+  iowait:  u64,
+  irq:     u64,
+  softirq: u64,
+  steal:   u64,
 }
 
 impl CpuStat {
-  pub fn total(&self) -> u64 {
-    self.user
-      + self.nice
-      + self.system
-      + self.idle
-      + self.iowait
-      + self.irq
-      + self.softirq
-      + self.steal
+  pub fn from_line(line: &str) -> Option<Self> {
+    let mut parts = line.split_ascii_whitespace();
+
+    Some(Self {
+      user:    parts.next()?.parse().ok()?,
+      nice:    parts.next()?.parse().ok()?,
+      system:  parts.next()?.parse().ok()?,
+      idle:    parts.next()?.parse().ok()?,
+      iowait:  parts.next()?.parse().ok()?,
+      irq:     parts.next()?.parse().ok()?,
+      softirq: parts.next()?.parse().ok()?,
+      steal:   parts.next()?.parse().ok()?,
+    })
   }
 
-  pub fn idle(&self) -> u64 {
-    self.idle + self.iowait
+  fn idle_time(self) -> u64 {
+    self.idle.saturating_add(self.iowait)
   }
 
-  pub fn usage(&self) -> f64 {
-    1.0 - self.idle() as f64 / self.total() as f64
+  fn working_time(self) -> u64 {
+    self
+      .user
+      .saturating_add(self.nice)
+      .saturating_add(self.system)
+      .saturating_add(self.irq)
+      .saturating_add(self.softirq)
+      .saturating_add(self.steal)
+  }
+
+  pub fn usage_percent(&self, old: &Self) -> f64 {
+    let idle_time = self.idle_time();
+    let old_idle_time = old.idle_time();
+
+    let working_time = self.working_time();
+    let old_working_time = old.working_time();
+
+    let total_time = idle_time.saturating_add(working_time);
+    let old_total_time = old_idle_time.saturating_add(old_working_time);
+
+    let working_period = working_time.saturating_sub(old_working_time) as f64;
+    let total_period = total_time.saturating_sub(old_total_time).max(1) as f64;
+
+    working_period / total_period
   }
 }
 
@@ -74,9 +89,6 @@ pub struct Cpu {
 
   pub available_epbs: Vec<String>,
   pub epb:            Option<String>,
-
-  pub stat: CpuStat,
-  pub info: Option<Arc<HashMap<String, String>>>,
 }
 
 impl PartialEq for Cpu {
@@ -104,12 +116,12 @@ impl fmt::Display for Cpu {
 impl Cpu {
   /// Get all CPUs.
   pub fn all() -> anyhow::Result<Vec<Cpu>> {
-    fn from_number(number: u32, cache: &CpuScanCache) -> anyhow::Result<Cpu> {
+    fn from_number(number: u32) -> anyhow::Result<Cpu> {
       let mut cpu = Cpu {
         number,
         ..Cpu::default()
       };
-      cpu.scan(cache)?;
+      cpu.scan()?;
 
       Ok(cpu)
     }
@@ -119,7 +131,6 @@ impl Cpu {
     log::info!("detecting CPUs...");
 
     let mut cpus = vec![];
-    let cache = CpuScanCache::default();
 
     log::debug!("scanning CPU entries in {PATH}");
 
@@ -145,14 +156,14 @@ impl Cpu {
         continue;
       };
 
-      cpus.push(from_number(number, &cache)?);
+      cpus.push(from_number(number)?);
     }
 
     // Fall back if sysfs iteration above fails to find any cpufreq CPUs.
     if cpus.is_empty() {
       log::warn!("no CPUs found in sysfs, using logical CPU count fallback");
       for number in 0..num_cpus::get() as u32 {
-        cpus.push(from_number(number, &cache)?);
+        cpus.push(from_number(number)?);
       }
     }
 
@@ -162,7 +173,7 @@ impl Cpu {
   }
 
   /// Scan CPU, tuning local copy of settings.
-  fn scan(&mut self, cache: &CpuScanCache) -> anyhow::Result<()> {
+  fn scan(&mut self) -> anyhow::Result<()> {
     log::debug!("scanning CPU {number}", number = self.number);
 
     let Self { number, .. } = self;
@@ -174,7 +185,11 @@ impl Cpu {
     self.has_cpufreq =
       fs::exists(format!("/sys/devices/system/cpu/cpu{number}/cpufreq"));
 
-    log::trace!("CPU {number} has cpufreq: {has_cpufreq}", number = self.number, has_cpufreq = self.has_cpufreq);
+    log::trace!(
+      "CPU {number} has cpufreq: {has_cpufreq}",
+      number = self.number,
+      has_cpufreq = self.has_cpufreq
+    );
 
     if self.has_cpufreq {
       self.scan_governor()?;
@@ -182,9 +197,6 @@ impl Cpu {
       self.scan_epp()?;
       self.scan_epb()?;
     }
-
-    self.scan_stat(cache)?;
-    self.scan_info(cache)?;
 
     Ok(())
   }
@@ -285,12 +297,13 @@ impl Cpu {
     let Self { number, .. } = self;
 
     self.epb = fs::read(format!(
-      "/sys/devices/system/cpu/cpu{number}/cpufreq/energy_performance_bias"
+      "/sys/devices/system/cpu/cpu{number}/power/energy_perf_bias"
     ))
     .with_context(|| format!("failed to read {self} EPB"))?;
 
     if self.epb.is_some() {
       self.available_epbs = vec![
+        "0".to_owned(),
         "1".to_owned(),
         "2".to_owned(),
         "3".to_owned(),
@@ -308,122 +321,11 @@ impl Cpu {
         "15".to_owned(),
         "performance".to_owned(),
         "balance-performance".to_owned(),
-        "balance_performance".to_owned(), // Alternative form with underscore.
+        "normal".to_owned(),
         "balance-power".to_owned(),
-        "balance_power".to_owned(), // Alternative form with underscore.
         "power".to_owned(),
       ];
     }
-
-    Ok(())
-  }
-
-  fn scan_stat(&mut self, cache: &CpuScanCache) -> anyhow::Result<()> {
-    log::trace!("scanning stat for CPU {number}", number = self.number);
-
-    // OnceCell::get_or_try_init is unstable. Cope:
-    let stat = match cache.stat.get() {
-      Some(stat) => stat,
-
-      None => {
-        let content = fs::read("/proc/stat")
-          .context("failed to read CPU stat")?
-          .context("/proc/stat does not exist")?;
-
-        cache
-          .stat
-          .set(HashMap::from_iter(content.lines().skip(1).filter_map(
-            |line| {
-              let mut parts = line.strip_prefix("cpu")?.split_whitespace();
-
-              let number = parts.next()?.parse().ok()?;
-
-              let stat = CpuStat {
-                user:    parts.next()?.parse().ok()?,
-                nice:    parts.next()?.parse().ok()?,
-                system:  parts.next()?.parse().ok()?,
-                idle:    parts.next()?.parse().ok()?,
-                iowait:  parts.next()?.parse().ok()?,
-                irq:     parts.next()?.parse().ok()?,
-                softirq: parts.next()?.parse().ok()?,
-                steal:   parts.next()?.parse().ok()?,
-              };
-
-              Some((number, stat))
-            },
-          )))
-          .map_err(|_| anyhow!("failed to initialize CPU stat cache"))?;
-
-        cache
-          .stat
-          .get()
-          .context("CPU stat cache was not initialized")?
-      },
-    };
-
-    self.stat = stat
-      .get(&self.number)
-      .with_context(|| format!("failed to get stat of {self}"))?
-      .clone();
-
-    Ok(())
-  }
-
-  fn scan_info(&mut self, cache: &CpuScanCache) -> anyhow::Result<()> {
-    log::trace!("scanning info for CPU {number}", number = self.number);
-
-    // OnceCell::get_or_try_init is unstable. Cope:
-    let info = match cache.info.get() {
-      Some(stat) => stat,
-
-      None => {
-        let content = fs::read("/proc/cpuinfo")
-          .context("failed to read CPU info")?
-          .context("/proc/cpuinfo does not exist")?;
-
-        let mut info = HashMap::new();
-        let mut current_number = None;
-        let mut current_data = HashMap::new();
-
-        macro_rules! try_save_data {
-          () => {
-            if let Some(number) = current_number.take() {
-              info.insert(number, Arc::new(mem::take(&mut current_data)));
-            }
-          };
-        }
-
-        for line in content.lines() {
-          let parts = line.splitn(2, ':').collect::<Vec<_>>();
-
-          if parts.len() == 2 {
-            let key = parts[0].trim();
-            let value = parts[1].trim();
-
-            if key == "processor" {
-              try_save_data!();
-
-              current_number = value.parse::<u32>().ok();
-            } else {
-              current_data.insert(key.to_owned(), value.to_owned());
-            }
-          }
-        }
-
-        try_save_data!();
-
-        cache
-          .info
-          .set(info)
-          .map_err(|_| anyhow!("failed to initialize CPU info cache"))?;
-        cache
-          .info
-          .get()
-          .context("CPU info cache was not initialized")?
-      },
-    };
-
-    self.info = info.get(&self.number).cloned();
 
     Ok(())
   }
@@ -459,7 +361,10 @@ impl Cpu {
 
     self.governor = Some(governor.to_owned());
 
-    log::info!("CPU {number} governor set to {governor}", number = self.number);
+    log::info!(
+      "CPU {number} governor set to {governor}",
+      number = self.number
+    );
 
     Ok(())
   }
@@ -516,9 +421,7 @@ impl Cpu {
     }
 
     fs::write(
-      format!(
-        "/sys/devices/system/cpu/cpu{number}/cpufreq/energy_performance_bias"
-      ),
+      format!("/sys/devices/system/cpu/cpu{number}/power/energy_perf_bias"),
       epb,
     )
     .with_context(|| {
@@ -751,7 +654,7 @@ impl Cpu {
 pub struct Delta {
   pub governor:                      Option<String>,
   pub energy_performance_preference: Option<String>,
-  pub energy_performance_bias:       Option<String>,
+  pub energy_perf_bias:              Option<String>,
   pub frequency_mhz_minimum:         Option<u64>,
   pub frequency_mhz_maximum:         Option<u64>,
 }
@@ -760,7 +663,7 @@ impl Delta {
   pub fn is_some(&self) -> bool {
     self.governor.is_some()
       && self.energy_performance_preference.is_some()
-      && self.energy_performance_bias.is_some()
+      && self.energy_perf_bias.is_some()
       && self.frequency_mhz_minimum.is_some()
       && self.frequency_mhz_maximum.is_some()
   }
@@ -773,9 +676,9 @@ impl Delta {
       energy_performance_preference: self
         .energy_performance_preference
         .or_else(|| that.energy_performance_preference.clone()),
-      energy_performance_bias:       self
-        .energy_performance_bias
-        .or_else(|| that.energy_performance_bias.clone()),
+      energy_perf_bias:              self
+        .energy_perf_bias
+        .or_else(|| that.energy_perf_bias.clone()),
       frequency_mhz_minimum:         self
         .frequency_mhz_minimum
         .or(that.frequency_mhz_minimum),
@@ -794,7 +697,7 @@ impl Delta {
       cpu.set_epp(epp)?;
     }
 
-    if let Some(epb) = &self.energy_performance_bias {
+    if let Some(epb) = &self.energy_perf_bias {
       cpu.set_epb(epb)?;
     }
 
