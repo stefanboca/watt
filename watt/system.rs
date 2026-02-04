@@ -27,7 +27,10 @@ use anyhow::{
 
 use crate::{
   config,
-  cpu,
+  cpu::{
+    self,
+    CpuStat,
+  },
   fs,
   power_supply,
 };
@@ -66,6 +69,8 @@ struct System {
   load_average_5min:  f64,
   load_average_15min: f64,
 
+  cpu_stat:         CpuStat,
+  old_cpu_stat:     CpuStat,
   /// All CPUs.
   cpus:             HashSet<Arc<cpu::Cpu>>,
   /// CPU usage and temperature log.
@@ -155,6 +160,15 @@ impl System {
       );
     }
 
+    {
+      let start = Instant::now();
+      self.scan_stat()?;
+      log::info!(
+        "scanned CPU stat in {millis}ms",
+        millis = start.elapsed().as_millis(),
+      );
+    }
+
     log::debug!("appending to system logs...");
 
     let at = Instant::now();
@@ -167,8 +181,7 @@ impl System {
     let cpu_log = CpuLog {
       at,
 
-      usage: self.cpus.iter().map(|cpu| cpu.stat.usage()).sum::<f64>()
-        / self.cpus.len() as f64,
+      usage: self.cpu_stat.usage_percent(&self.old_cpu_stat),
 
       temperature: self.cpu_temperatures.values().sum::<f64>()
         / self.cpu_temperatures.len() as f64,
@@ -202,6 +215,27 @@ impl System {
       log::debug!("appending power supply log item: {power_supply_log:?}");
       self.power_supply_log.push_back(power_supply_log);
     }
+
+    Ok(())
+  }
+
+  fn scan_stat(&mut self) -> anyhow::Result<()> {
+    log::debug!("scanning CPU usage...");
+
+    let content = fs::read("/proc/stat")
+      .context("failed to read CPU stat")?
+      .context("/proc/stat does not exist")?;
+
+    let line = content
+      .lines()
+      .filter_map(|line| line.strip_prefix("cpu "))
+      .next()
+      .context("failed to find CPU times")?;
+
+    let new_stat =
+      CpuStat::from_line(line).context("failed to parse CPU times")?;
+
+    (self.old_cpu_stat, self.cpu_stat) = (self.cpu_stat, new_stat);
 
     Ok(())
   }

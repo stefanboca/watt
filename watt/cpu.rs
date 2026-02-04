@@ -19,40 +19,65 @@ use crate::fs;
 
 #[derive(Default, Debug, Clone, PartialEq)]
 struct CpuScanCache {
-  stat: OnceCell<HashMap<u32, CpuStat>>,
   info: OnceCell<HashMap<u32, Arc<HashMap<String, String>>>>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct CpuStat {
-  pub user:    u64,
-  pub nice:    u64,
-  pub system:  u64,
-  pub idle:    u64,
-  pub iowait:  u64,
-  pub irq:     u64,
-  pub softirq: u64,
-  pub steal:   u64,
+  user:    u64,
+  nice:    u64,
+  system:  u64,
+  idle:    u64,
+  iowait:  u64,
+  irq:     u64,
+  softirq: u64,
+  steal:   u64,
 }
 
 impl CpuStat {
-  pub fn total(&self) -> u64 {
-    self.user
-      + self.nice
-      + self.system
-      + self.idle
-      + self.iowait
-      + self.irq
-      + self.softirq
-      + self.steal
+  pub fn from_line(line: &str) -> Option<Self> {
+    let mut parts = line.split_ascii_whitespace();
+
+    Some(Self {
+      user:    parts.next()?.parse().ok()?,
+      nice:    parts.next()?.parse().ok()?,
+      system:  parts.next()?.parse().ok()?,
+      idle:    parts.next()?.parse().ok()?,
+      iowait:  parts.next()?.parse().ok()?,
+      irq:     parts.next()?.parse().ok()?,
+      softirq: parts.next()?.parse().ok()?,
+      steal:   parts.next()?.parse().ok()?,
+    })
   }
 
-  pub fn idle(&self) -> u64 {
-    self.idle + self.iowait
+  fn idle_time(self) -> u64 {
+    self.idle.saturating_add(self.iowait)
   }
 
-  pub fn usage(&self) -> f64 {
-    1.0 - self.idle() as f64 / self.total() as f64
+  fn working_time(self) -> u64 {
+    self
+      .user
+      .saturating_add(self.nice)
+      .saturating_add(self.system)
+      .saturating_add(self.irq)
+      .saturating_add(self.softirq)
+      .saturating_add(self.steal)
+  }
+
+  pub fn usage_percent(&self, old: &Self) -> f64 {
+    let idle_time = self.idle_time();
+    let old_idle_time = old.idle_time();
+
+    let working_time = self.working_time();
+    let old_working_time = old.working_time();
+
+    let total_time = idle_time.saturating_add(working_time);
+    let old_total_time = old_idle_time.saturating_add(old_working_time);
+
+    let working_period = working_time.saturating_sub(old_working_time) as f64;
+    let total_period = total_time.saturating_sub(old_total_time).max(1) as f64;
+
+    working_period / total_period
   }
 }
 
@@ -75,7 +100,6 @@ pub struct Cpu {
   pub available_epbs: Vec<String>,
   pub epb:            Option<String>,
 
-  pub stat: CpuStat,
   pub info: Option<Arc<HashMap<String, String>>>,
 }
 
@@ -187,7 +211,6 @@ impl Cpu {
       self.scan_epb()?;
     }
 
-    self.scan_stat(cache)?;
     self.scan_info(cache)?;
 
     Ok(())
@@ -318,57 +341,6 @@ impl Cpu {
         "power".to_owned(),
       ];
     }
-
-    Ok(())
-  }
-
-  fn scan_stat(&mut self, cache: &CpuScanCache) -> anyhow::Result<()> {
-    log::trace!("scanning stat for CPU {number}", number = self.number);
-
-    // OnceCell::get_or_try_init is unstable. Cope:
-    let stat = match cache.stat.get() {
-      Some(stat) => stat,
-
-      None => {
-        let content = fs::read("/proc/stat")
-          .context("failed to read CPU stat")?
-          .context("/proc/stat does not exist")?;
-
-        cache
-          .stat
-          .set(HashMap::from_iter(content.lines().skip(1).filter_map(
-            |line| {
-              let mut parts = line.strip_prefix("cpu")?.split_whitespace();
-
-              let number = parts.next()?.parse().ok()?;
-
-              let stat = CpuStat {
-                user:    parts.next()?.parse().ok()?,
-                nice:    parts.next()?.parse().ok()?,
-                system:  parts.next()?.parse().ok()?,
-                idle:    parts.next()?.parse().ok()?,
-                iowait:  parts.next()?.parse().ok()?,
-                irq:     parts.next()?.parse().ok()?,
-                softirq: parts.next()?.parse().ok()?,
-                steal:   parts.next()?.parse().ok()?,
-              };
-
-              Some((number, stat))
-            },
-          )))
-          .map_err(|_| anyhow!("failed to initialize CPU stat cache"))?;
-
-        cache
-          .stat
-          .get()
-          .context("CPU stat cache was not initialized")?
-      },
-    };
-
-    self.stat = stat
-      .get(&self.number)
-      .with_context(|| format!("failed to get stat of {self}"))?
-      .clone();
 
     Ok(())
   }
